@@ -1,0 +1,389 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import matplotlib
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+import math
+import random
+
+#############################################
+# 1) Augmentation: 弱增強 / 強增強
+#############################################
+def weak_augmentation(x):
+    jitter = x + torch.randn_like(x) * 0.05
+    scale = torch.randn(x.size(0), 1, x.size(2), device=x.device) * 0.1 + 1.0
+    return jitter * scale
+
+def strong_augmentation(x):
+    jitter = x + torch.randn_like(x) * 0.1
+    scale = torch.randn(x.size(0), 1, x.size(2), device=x.device) * 0.2 + 1.0
+    x_aug = jitter * scale
+    
+    batch, seq_len, channels = x_aug.size()
+    num_segments = 4  
+    seg_len = seq_len // num_segments
+    x_perm = []
+    for i in range(batch):
+        segments = []
+        for j in range(num_segments):
+            segments.append(x_aug[i, j*seg_len:(j+1)*seg_len, :])
+        if seq_len % num_segments != 0:
+            segments.append(x_aug[i, num_segments*seg_len:, :])
+        perm = torch.randperm(len(segments))
+        new_seq = torch.cat([segments[p] for p in perm], dim=0).unsqueeze(0)
+        x_perm.append(new_seq)
+    x_perm = torch.cat(x_perm, dim=0)
+    return x_perm
+
+#############################################
+# 2) 頻域特徵 (FCVAE) & 時域特徵
+#############################################
+class LocalFrequencyModule(nn.Module):
+    def __init__(self, input_channels, hidden_dim, n_heads=4):
+        super(LocalFrequencyModule, self).__init__()
+        self.fc_in = nn.Linear(input_channels, hidden_dim)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=n_heads, batch_first=True)
+        self.fc_out = nn.Linear(hidden_dim, hidden_dim)
+    
+    def forward(self, x):
+        fft_x = torch.fft.rfft(x, dim=1)
+        fft_x = torch.abs(fft_x)
+        fft_x = self.fc_in(fft_x)
+        attn_output, _ = self.attention(fft_x, fft_x, fft_x)
+        output = self.fc_out(attn_output)
+        return output
+
+class GlobalFrequencyModule(nn.Module):
+    def __init__(self, input_channels, hidden_dim):
+        super(GlobalFrequencyModule, self).__init__()
+        self.fc = nn.Linear(input_channels, hidden_dim)
+    
+    def forward(self, x):
+        fft_x = torch.fft.rfft(x, dim=1)
+        fft_x = torch.abs(fft_x)
+        fft_avg = fft_x.mean(dim=1)
+        output = self.fc(fft_avg)
+        output = output.unsqueeze(1)
+        return output
+
+class TimeDomainModule(nn.Module):
+    def __init__(self, input_channels, hidden_dim, seq_len, num_transformer_layers=1, nhead=4):
+        super(TimeDomainModule, self).__init__()
+        self.conv1d = nn.Conv1d(in_channels=input_channels, out_channels=hidden_dim, kernel_size=3, padding=1)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+    
+    def forward(self, x):
+        x_conv = self.conv1d(x.transpose(1,2))
+        x_conv = F.relu(x_conv)
+        x_conv = x_conv.transpose(1,2)
+        x_trans = self.transformer_encoder(x_conv.transpose(0,1))
+        x_trans = x_trans.transpose(0,1)
+        return x_trans
+
+#############################################
+# 3) Encoder (VAE)
+#############################################
+class Encoder(nn.Module):
+    def __init__(self, input_channels, hidden_dim, latent_dim, seq_len):
+        super(Encoder, self).__init__()
+        self.local_freq = LocalFrequencyModule(input_channels, hidden_dim)
+        self.global_freq = GlobalFrequencyModule(input_channels, hidden_dim)
+        self.time_domain = TimeDomainModule(input_channels, hidden_dim, seq_len)
+        
+        self.fc_mu = nn.Linear(hidden_dim*3, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim*3, latent_dim)
+    
+    def forward(self, x):
+        lf = self.local_freq(x)
+        gf = self.global_freq(x)
+        td = self.time_domain(x)
+        
+        lf = lf.mean(dim=1)
+        gf = gf.mean(dim=1)
+        td = td.mean(dim=1)
+        
+        features = torch.cat([lf, gf, td], dim=-1)
+        mu = self.fc_mu(features)
+        logvar = self.fc_logvar(features)
+        
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z, mu, logvar
+
+#############################################
+# 4) TS-TCC Contrastive Loss
+#############################################
+def ts_tcc_contrastive_loss(z1, z2, temperature=0.5):
+    batch_size = z1.size(0)
+    z = torch.cat([z1, z2], dim=0)
+    z = F.normalize(z, dim=1)
+    sim_matrix = torch.matmul(z, z.T)
+    mask = torch.eye(2*batch_size, dtype=torch.bool, device=z.device)
+    sim_matrix = sim_matrix.masked_fill(mask, -9e15)
+    pos_sim = torch.cat([
+        torch.diag(sim_matrix, batch_size),
+        torch.diag(sim_matrix, -batch_size)
+    ])
+    loss = -torch.log(
+        torch.exp(pos_sim / temperature) /
+        torch.sum(torch.exp(sim_matrix / temperature), dim=1)
+    )
+    return loss.mean()
+
+#############################################
+# 5) Double Decoder (N-BEATS), 輸出 (N, seq_len, channels)
+#############################################
+class NBeatsBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(NBeatsBlock, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.theta = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        x_ = F.relu(self.fc1(x))
+        x_ = F.relu(self.fc2(x_))
+        theta = self.theta(x_)
+        return theta
+
+class DoubleDecoder(nn.Module):
+    """
+    輸出 shape = (N, seq_len, channels)
+    """
+    def __init__(self, latent_dim, seq_len, output_channels, hidden_dim=64, num_blocks=3):
+        super(DoubleDecoder, self).__init__()
+        self.seq_len = seq_len
+        self.output_channels = output_channels
+        
+        self.blocks1 = nn.ModuleList([
+            NBeatsBlock(latent_dim, hidden_dim, latent_dim) for _ in range(num_blocks)
+        ])
+        self.fc_out1 = nn.Linear(latent_dim, seq_len * output_channels)
+        
+        self.blocks2 = nn.ModuleList([
+            NBeatsBlock(latent_dim, hidden_dim, latent_dim) for _ in range(num_blocks)
+        ])
+        self.fc_out2 = nn.Linear(latent_dim, seq_len * output_channels)
+    
+    def forward(self, z):
+        # Decoder1
+        residual1 = z
+        for block in self.blocks1:
+            delta1 = block(residual1)
+            residual1 = residual1 - delta1
+        out1 = self.fc_out1(residual1)
+        xhat1 = out1.view(-1, self.seq_len, self.output_channels)
+        
+        # Decoder2
+        residual2 = z
+        for block in self.blocks2:
+            delta2 = block(residual2)
+            residual2 = residual2 - delta2
+        out2 = self.fc_out2(residual2)
+        xhat2 = out2.view(-1, self.seq_len, self.output_channels)
+        
+        return xhat1, xhat2
+
+#############################################
+# 6) 改用線性 ramp-up 取代 epsilon^-epoch
+#############################################
+def get_alpha_linear(epoch, ramp_epochs=10, alpha_init=0.0, alpha_final=.3):
+    """
+    線性 ramp-up: 從 epoch=1 -> ramp_epochs 期間,
+    alpha 由 alpha_init 線性增長到 alpha_final
+    """
+    ratio = min(1.0, epoch / ramp_epochs)
+    alpha_n = alpha_init + ratio * (alpha_final - alpha_init)
+    return alpha_n
+
+def ts_exponential_loss_function(x, xhat1, xhat2,
+                                 mu, logvar,
+                                 z1, z2,
+                                 epoch,
+                                 ramp_epochs=10,
+                                 lambda_kl=0.01,
+                                 lambda_contrast=0.1):
+    """
+    改為線性 ramp-up alpha_n
+    x, xhat1, xhat2 => (N, seq_len, channels)
+    """
+    alpha_n = get_alpha_linear(epoch, ramp_epochs=ramp_epochs, alpha_init=0.0, alpha_final=.3)
+    
+    # dist over time+channels => shape=(N,)
+    dist1 = torch.norm(xhat1 - x, p=2, dim=(1,2))
+    dist2 = torch.norm(xhat2 - x, p=2, dim=(1,2))
+    
+    L1 = (1-alpha_n) * dist1 + alpha_n* dist2
+    L2 = (1-alpha_n) * dist2 - alpha_n* dist1
+    recon_loss = (L1 + L2).mean()
+    
+    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    contrast_loss = ts_tcc_contrastive_loss(z1, z2)
+    
+    total_loss = recon_loss + lambda_kl * kl_loss + lambda_contrast * contrast_loss
+    return total_loss, recon_loss, kl_loss, contrast_loss, alpha_n
+
+#############################################
+# 7) 主模型
+#############################################
+class AnomalyDetectionModel(nn.Module):
+    def __init__(self, input_channels, seq_len, hidden_dim, latent_dim, output_channels):
+        super(AnomalyDetectionModel, self).__init__()
+        self.encoder = Encoder(input_channels, hidden_dim, latent_dim, seq_len)
+        self.double_decoder = DoubleDecoder(latent_dim, seq_len, output_channels, hidden_dim)
+    
+    def forward(self, x):
+        z, mu, logvar = self.encoder(x)
+        
+        x_weak = weak_augmentation(x)
+        x_strong = strong_augmentation(x)
+        z1, _, _ = self.encoder(x_weak)
+        z2, _, _ = self.encoder(x_strong)
+        
+        xhat1, xhat2 = self.double_decoder(z)
+        
+        return xhat1, xhat2, z1, z2, mu, logvar
+
+#############################################
+# 8) 大 class => init, train, predict, reconstruct
+#    無監督 => DataLoader 只含 (x,)
+#############################################
+class AnomalyDetectionPipeline:
+    def __init__(self, input_channels, seq_len, hidden_dim, latent_dim,
+                 output_channels, ramp_epochs=10, lambda_kl=0.01, lambda_contrast=0.1,
+                 lr=1e-3, device=None):
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.model = AnomalyDetectionModel(input_channels, seq_len, hidden_dim,
+                                           latent_dim, output_channels).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        
+        self.ramp_epochs = ramp_epochs
+        self.lambda_kl = lambda_kl
+        self.lambda_contrast = lambda_contrast
+    
+    def train(self, train_loader, num_epochs=10):
+        for epoch in range(1, num_epochs+1):
+            self.model.train()
+            total_loss = 0.0
+            
+            for batch in train_loader:
+                (x,) = batch
+                x = x.to(self.device)
+                
+                self.optimizer.zero_grad()
+                xhat1, xhat2, z1, z2, mu, logvar = self.model(x)
+                
+                loss, recon_val, kl_val, contrast_val, alpha_n = ts_exponential_loss_function(
+                    x, xhat1, xhat2,
+                    mu, logvar, z1, z2,
+                    epoch=epoch,
+                    ramp_epochs=self.ramp_epochs,
+                    lambda_kl=self.lambda_kl,
+                    lambda_contrast=self.lambda_contrast
+                )
+                
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(train_loader)
+            print(f"Epoch {epoch}/{num_epochs}, Loss: {avg_loss:.4f}, alpha_n={alpha_n:.3f}")
+    
+    def predict(self, data, threshold=0.02):
+        """
+        data: shape=(N, seq_len, channels)
+        => xhat1, xhat2 => dist => scores => preds
+        => xhat1, xhat2 => (N, seq_len, channels)
+        """
+        self.model.eval()
+        data_t = torch.tensor(data, dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            xhat1, xhat2, z1, z2, mu, logvar = self.model(data_t)
+            dist1 = torch.norm(xhat1 - data_t, p=2, dim=(1,2))
+            dist2 = torch.norm(xhat2 - data_t, p=2, dim=(1,2))
+            scores = 0.5*(dist1 + dist2)
+            
+            preds = (scores > threshold).float()
+        
+        return preds.cpu().numpy(), scores.cpu().numpy()
+    
+    def reconstruct(self, data):
+        """
+        data: (N, seq_len, channels)
+        => xhat1, xhat2 => (N, seq_len, channels)
+        """
+        self.model.eval()
+        data_t = torch.tensor(data, dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            xhat1, xhat2, z1, z2, mu, logvar = self.model(data_t)
+        
+        return xhat1.cpu().numpy(), xhat2.cpu().numpy()
+
+#############################################
+# 9) 使用示範
+#############################################
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 模擬無監督資料
+    num_train = 200
+    seq_len = 30
+    channels = 1
+    train_data = np.array([[np.sin(np.linspace(0, 4*np.pi, seq_len)).tolist()]]*num_train)
+    train_data = train_data.reshape(num_train, seq_len, 1).astype(np.float32)
+    # np.random.randn(num_train, seq_len, channels).astype(np.float32)
+    
+    train_dataset = TensorDataset(torch.tensor(train_data))
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    
+    # 建立 pipeline (線性 ramp-up, ramp_epochs=5)
+    pipeline = AnomalyDetectionPipeline(
+        input_channels=channels,
+        seq_len=seq_len,
+        hidden_dim=64,
+        latent_dim=32,
+        output_channels=channels,
+        ramp_epochs=100,       # 前5 epoch 內線性增長 alpha
+        lambda_kl=0.01,
+        lambda_contrast=0.1,
+        lr=1e-3,
+        device=device
+    )
+    
+    # 訓練
+    pipeline.train(train_loader, num_epochs=100)
+    
+    # 測試
+    test_data = np.random.randn(10, seq_len, channels).astype(np.float32)
+    preds, scores = pipeline.predict(test_data, threshold=3.0)
+    print("preds=", preds)
+    print("scores=", scores)
+    
+    # 重構
+    xhat1, xhat2 = pipeline.reconstruct(test_data[:2])
+    print("xhat1 shape=", xhat1.shape)  # (2, seq_len, channels)
+    print("xhat2 shape=", xhat2.shape)
+    
+    print("Done.")
+
+
+    # xhat1, xhat2 = pipeline.reconstruct(test_data[:2])
+    import matplotlib.pyplot as plt
+    xhat1, xhat2 = pipeline.reconstruct(train_data[:2])
+    plt.figure(figsize = (24, 3))
+    plt.plot(train_data[0][:, 0], color = "black", linewidth = 4)
+    plt.plot(xhat1[0][:, 0], color = "orange")
+    plt.show()
